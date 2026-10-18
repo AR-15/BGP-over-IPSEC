@@ -13,11 +13,7 @@ FortiGate 与 CSR2、CSR3 之间各建 3 条 IKEv2 路由型 IPsec 隧道（共 
 - **防泄漏**：两端 prefix-list 只收发业务网段，不收发 192.168.x 和 172.16.x；各自配一条 distance 254 的黑洞路由兜底。
 - **CSR2 与 CSR3 互通**经 FortiGate 转发，依赖 Zone 的 `intrazone allow`。
 
-## 拓扑
 
-&#91;embedded content: 实验拓扑 · 3 台设备、6 条隧道、3 台服务器\]
-
-实线是物理链路，承载隧道的端点地址；虚线是其上的 IPsec 隧道，两端的 /30 地址就是 BGP 邻居地址。CSR2 与 CSR3 之间的流量经 FortiGate 转发。
 
 ## 地址规划
 
