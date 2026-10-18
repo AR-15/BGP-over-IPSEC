@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#####################################################################
+# IPsec ECMP 压测脚本（iperf3），三台服务器用同一个脚本
+#
+#   Server-FGT   接 FortiGate port3   10.0.0.10-13/24  网关 10.0.0.1
+#   Server-CSR2  接 CSR2 Gi2          10.2.2.10-13/24  网关 10.2.2.1
+#   Server-CSR3  接 CSR3 Gi3          10.3.3.10-13/24  网关 10.3.3.1
+#
+# 为什么每台 4 个 IP：两端 ECMP 都按"源 IP + 目的 IP"哈希，
+# 同一对 IP 永远只走一条隧道。4 x 4 = 16 对 IP，才能把流量分到 3 条隧道上。
+#
+# 用法：
+#   sudo ./stress-test.sh setup <fgt|csr2|csr3> [网卡]   配 4 个地址和到 10.0.0.0/8 的路由
+#   ./stress-test.sh server                             启动 48 个 iperf3 服务端（接收端执行）
+#   ./stress-test.sh tcp <目的站点> [秒数] [每对并发数]   16 对 IP 同时打 TCP
+#   ./stress-test.sh udp <目的站点> <每对速率> [秒数]     16 对 IP 同时打 UDP，如 20M
+#   ./stress-test.sh stop                               结束本机所有 iperf3
+#
+# 环境变量：
+#   EXTRA="-R"        反向（接收端向发送端灌流量）
+#   EXTRA="--bidir"   双向同时（iperf3 3.7+）
+#   LOGDIR=./logs     JSON 日志目录，默认 ./iperf-logs
+#
+# 依赖：iperf3、python3（汇总结果）
+#####################################################################
+set -uo pipefail
+
+declare -A NET=( [fgt]=10.0.0 [csr2]=10.2.2 [csr3]=10.3.3 )
+declare -A SITE_IDX=( [fgt]=0 [csr2]=1 [csr3]=2 )
+HOSTS=(10 11 12 13)
+BASEPORT=5201
+PAIRS=$(( ${#HOSTS[@]} * ${#HOSTS[@]} ))   # 16
+LOGDIR=${LOGDIR:-./iperf-logs}
+EXTRA=${EXTRA:-}
+T=60
+P=1
+RATE=""
+
+usage() {
+    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+die() { echo "错误：$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少 $1，请先安装（apt/yum install $1）"; }
+
+valid_site() { [[ -n ${NET[$1]:-} ]] || die "未知站点 '$1'，可选 fgt / csr2 / csr3"; }
+
+self_site() {
+    local s
+    for s in "${!NET[@]}"; do
+        if ip -4 -o addr show | grep -q "inet ${NET[$s]}.${HOSTS[0]}/"; then
+            echo "$s"; return
+        fi
+    done
+    die "识别不到本机站点，请先执行 setup"
+}
+
+cmd_setup() {
+    local site=${1:-}
+    [[ -n $site ]] || die "setup 需要站点名：fgt / csr2 / csr3"
+    valid_site "$site"
+    [[ $EUID -eq 0 ]] || die "setup 需要 root（sudo）"
+    local dev=${2:-$(ip -4 route show default | awk '{print $5; exit}')}
+    [[ -n $dev ]] || die "没有默认路由，请指定接测试网络的网卡名，如 eth1"
+    local p=${NET[$site]} h
+    ip link set "$dev" up
+    for h in "${HOSTS[@]}"; do
+        ip addr replace "$p.$h/24" dev "$dev"
+    done
+    ip route replace 10.0.0.0/8 via "$p.1" dev "$dev"
+    echo "已在 $dev 上配置 $p.${HOSTS[0]}-${HOSTS[-1]}/24，10.0.0.0/8 经 $p.1"
+    echo "提示：以上为临时配置，重启失效；如开了 firewalld/ufw，请放行 TCP/UDP $BASEPORT-$((BASEPORT + PAIRS*3 - 1))"
+}
+
+cmd_server() {
+    need iperf3
+    local n=$(( PAIRS * 3 )) i started=0
+    for (( i = 0; i < n; i++ )); do
+        if iperf3 -s -p $(( BASEPORT + i )) -D 2>/dev/null; then
+            started=$(( started + 1 ))
+        fi
+    done
+    echo "已启动 $started 个 iperf3 服务端，端口 $BASEPORT-$(( BASEPORT + n - 1 ))"
+    echo "（每个源站点用独立的 16 个端口，CSR2 和 CSR3 可以同时往这台打）"
+}
+
+summarize() {
+    local mode=$1; shift
+    python3 - "$mode" "$@" <<'PY'
+import json, os, sys
+
+mode, files = sys.argv[1], sys.argv[2:]
+total, ok, rows = 0.0, 0, []
+for f in sorted(files):
+    tag = os.path.basename(f).rsplit(".", 1)[0]
+    try:
+        with open(f) as fh:
+            d = json.load(fh)
+    except Exception:
+        rows.append((tag, None, "日志解析失败")); continue
+    if "error" in d:
+        rows.append((tag, None, d["error"])); continue
+    conn = d.get("start", {}).get("connected", [{}])[0]
+    tag = f'{conn.get("local_host", "?")} -> {conn.get("remote_host", "?")}'
+    end = d.get("end", {})
+    if mode == "tcp":
+        bps = end.get("sum_received", {}).get("bits_per_second", 0.0)
+        extra = f'重传 {end.get("sum_sent", {}).get("retransmits", 0)}'
+    else:
+        s = end.get("sum", {})
+        bps = s.get("bits_per_second", 0.0)
+        extra = f'丢包 {s.get("lost_percent", 0.0):.2f}%  抖动 {s.get("jitter_ms", 0.0):.2f}ms'
+    total += bps; ok += 1
+    rows.append((tag, bps, extra))
+
+print()
+print(f'{"源 -> 目的":<30}{"Mbps":>10}   备注')
+print("-" * 70)
+for tag, bps, extra in rows:
+    val = f"{bps/1e6:10.1f}" if bps is not None else f'{"失败":>10}'
+    print(f"{tag:<30}{val}   {extra}")
+print("-" * 70)
+print(f'{"合计（成功 %d/%d）" % (ok, len(rows)):<30}{total/1e6:10.1f}')
+PY
+}
+
+run_pairs() {
+    local mode=$1 dst=$2
+    need iperf3; need python3
+    valid_site "$dst"
+    local src; src=$(self_site)
+    [[ $src != "$dst" ]] || die "目的站点不能是本机所在站点"
+    local sp=${NET[$src]} dp=${NET[$dst]}
+    local base=$(( BASEPORT + SITE_IDX[$src] * PAIRS ))
+    local ts; ts=$(date +%Y%m%d-%H%M%S)
+    local prefix="$LOGDIR/$ts-$mode-$src-$dst"
+    mkdir -p "$LOGDIR"
+
+    local s d idx=0 pids=()
+    for s in "${HOSTS[@]}"; do
+        for d in "${HOSTS[@]}"; do
+            local port=$(( base + idx ))
+            local log="$prefix-$s-$d.json"
+            if [[ $mode == tcp ]]; then
+                # shellcheck disable=SC2086
+                iperf3 -c "$dp.$d" -B "$sp.$s" -p "$port" -t "$T" -P "$P" $EXTRA -J >"$log" 2>&1 &
+            else
+                # shellcheck disable=SC2086
+                iperf3 -c "$dp.$d" -B "$sp.$s" -p "$port" -t "$T" -u -b "$RATE" -l 1300 $EXTRA -J >"$log" 2>&1 &
+            fi
+            pids+=("$!")
+            idx=$(( idx + 1 ))
+        done
+    done
+
+    if [[ $mode == tcp ]]; then
+        echo "$src -> $dst：$idx 对 IP，每对 $P 条 TCP 流，持续 ${T}s ${EXTRA:+（$EXTRA）}"
+    else
+        echo "$src -> $dst：$idx 对 IP，每对 UDP $RATE，持续 ${T}s ${EXTRA:+（$EXTRA）}"
+    fi
+    echo "这段时间可在设备上观察三条隧道的计数和速率……"
+    wait "${pids[@]}"
+    summarize "$mode" "$prefix"-*.json
+    echo "原始日志：$prefix-*.json"
+}
+
+case ${1:-} in
+    setup)  shift; cmd_setup "$@" ;;
+    server) cmd_server ;;
+    tcp)    [[ -n ${2:-} ]] || usage
+            T=${3:-60}; P=${4:-1}
+            run_pairs tcp "$2" ;;
+    udp)    [[ -n ${2:-} && -n ${3:-} ]] || usage
+            RATE=$3; T=${4:-60}
+            run_pairs udp "$2" ;;
+    stop)   pkill -x iperf3 && echo "已结束本机 iperf3" || echo "本机没有运行中的 iperf3" ;;
+    *)      usage ;;
+esac
